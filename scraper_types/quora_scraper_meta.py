@@ -1,11 +1,10 @@
-# scraper_types/quora_scraper_meta.py (FINAL CLEAN VERSION)
 import re
 import time
 from typing import Dict, List, Optional
 from playwright.async_api import Page
+from common.anti_detection import goto_resilient
 
 
-# ----------------- Helpers -----------------
 def _dedupe(seq: List[str]) -> List[str]:
     seen, out = set(), []
     for s in seq:
@@ -24,16 +23,7 @@ def _contacts(text: Optional[str]) -> Dict[str, List[str]]:
 
 
 def _external_links_from_hrefs(hrefs: List[str]) -> List[str]:
-    """
-    Extract only true external links (exclude Quora internal links).
-    """
-    out = [
-        h for h in hrefs
-        if h
-        and h.startswith("http")
-        and "quora.com" not in h.lower()            # exclude all Quora internal links
-        and "quorablog.quora.com" not in h.lower()  # exclude Quora blog
-    ]
+    out = [h for h in hrefs if h and h.startswith("http") and "quora.com" not in h]
     return _dedupe(out)[:20]
 
 
@@ -41,23 +31,10 @@ def _guess_type(url: str) -> str:
     return "profile" if "/profile/" in url.lower() else "question"
 
 
-async def _meta(page: Page, name: Optional[str] = None, prop: Optional[str] = None) -> Optional[str]:
-    selector = f'meta[name="{name}"]' if name else f'meta[property="{prop}"]'
-    try:
-        el = await page.query_selector(selector)
-        if el:
-            content = await el.get_attribute("content")
-            return content.strip() if content else None
-    except Exception:
-        pass
-    return None
-
-
-# ----------------- Main Extraction -----------------
 async def _extract_page_meta_data(page: Page, url: str) -> Dict:
     page_type = _guess_type(url)
-    title = await _meta(page, prop="og:title") or await _meta(page, name="title") or await page.title()
-    description = await _meta(page, name="description") or await _meta(page, prop="og:description")
+    title = await page.title()
+    description = None
     href_nodes = await page.query_selector_all("a[href]")
     hrefs = [await a.get_attribute("href") for a in href_nodes]
     external_links = _external_links_from_hrefs(hrefs)
@@ -66,36 +43,30 @@ async def _extract_page_meta_data(page: Page, url: str) -> Dict:
     return {
         "platform": "quora",
         "quora_link": url,
-        "source": "quora",
+        "source": "quora-scraper",
         "type": page_type,
         "title": title,
         "description": description,
         "external_links": external_links,
         "emails": contact_info["emails"],
         "phones": contact_info["phones"],
-        "scraped_at": int(time.time())
+        "scraped_at": int(time.time()),
     }
 
 
-# ----------------- Entrypoint -----------------
 async def scrape_quora_meta_seq(urls: List[str], page: Page) -> List[Dict]:
-    """
-    Asynchronously scrapes meta data for Quora URLs using a PRE-CONFIGURED page object.
-    """
     results = []
-    await page.route("**/*", lambda route: route.abort() if route.request.resource_type in {"image", "font", "stylesheet"} else route.continue_())
     for url in _dedupe(urls):
-        item = {}
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await goto_resilient(page, url)  # ✅ anti-detection nav
             item = await _extract_page_meta_data(page, url)
         except Exception as e:
             item = {
                 "platform": "quora",
                 "quora_link": url,
-                "source": "quora",
+                "source": "quora-scraper",
                 "error": f"{e.__class__.__name__}: {str(e)}",
-                "scraped_at": int(time.time())
+                "scraped_at": int(time.time()),
             }
         results.append(item)
     return results
