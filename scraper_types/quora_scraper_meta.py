@@ -1,13 +1,11 @@
-# scraper_types/quora_scraper_meta.py (FINAL REFACTORED VERSION)
+# scraper_types/quora_scraper_meta.py (FINAL CLEAN VERSION)
 import re
-import json
 import time
-import asyncio
 from typing import Dict, List, Optional
-from urllib.parse import urlparse
-from playwright.async_api import Page, TimeoutError as PWTimeout
+from playwright.async_api import Page
 
-# --- All of your original helper functions are kept ---
+
+# ----------------- Helpers -----------------
 def _dedupe(seq: List[str]) -> List[str]:
     seen, out = set(), []
     for s in seq:
@@ -16,18 +14,32 @@ def _dedupe(seq: List[str]) -> List[str]:
             out.append(s)
     return out
 
+
 def _contacts(text: Optional[str]) -> Dict[str, List[str]]:
-    if not text: return {"emails": [], "phones": []}
+    if not text:
+        return {"emails": [], "phones": []}
     emails = list({m.group(0) for m in re.finditer(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)})
     phones = list({m.group(0) for m in re.finditer(r"\+?\d[\d\s().\-]{8,}\d", text)})
     return {"emails": emails, "phones": phones}
 
+
 def _external_links_from_hrefs(hrefs: List[str]) -> List[str]:
-    out = [h for h in hrefs if h and h.startswith("http") and "quora.com" not in h]
+    """
+    Extract only true external links (exclude Quora internal links).
+    """
+    out = [
+        h for h in hrefs
+        if h
+        and h.startswith("http")
+        and "quora.com" not in h.lower()            # exclude all Quora internal links
+        and "quorablog.quora.com" not in h.lower()  # exclude Quora blog
+    ]
     return _dedupe(out)[:20]
+
 
 def _guess_type(url: str) -> str:
     return "profile" if "/profile/" in url.lower() else "question"
+
 
 async def _meta(page: Page, name: Optional[str] = None, prop: Optional[str] = None) -> Optional[str]:
     selector = f'meta[name="{name}"]' if name else f'meta[property="{prop}"]'
@@ -40,7 +52,8 @@ async def _meta(page: Page, name: Optional[str] = None, prop: Optional[str] = No
         pass
     return None
 
-# --- Your original data extraction function is kept ---
+
+# ----------------- Main Extraction -----------------
 async def _extract_page_meta_data(page: Page, url: str) -> Dict:
     page_type = _guess_type(url)
     title = await _meta(page, prop="og:title") or await _meta(page, name="title") or await page.title()
@@ -51,19 +64,25 @@ async def _extract_page_meta_data(page: Page, url: str) -> Dict:
     text_blob = " ".join(filter(None, [title, description]))
     contact_info = _contacts(text_blob)
     return {
-        "platform": "quora", "quora_link": url, "source": "meta_advanced",
-        "type": page_type, "title": title, "description": description,
-        "external_links": external_links, "emails": contact_info["emails"],
-        "phones": contact_info["phones"], "scraped_at": int(time.time())
+        "platform": "quora",
+        "quora_link": url,
+        "source": "quora",
+        "type": page_type,
+        "title": title,
+        "description": description,
+        "external_links": external_links,
+        "emails": contact_info["emails"],
+        "phones": contact_info["phones"],
+        "scraped_at": int(time.time())
     }
 
-# --- This is the new, refactored main function ---
+
+# ----------------- Entrypoint -----------------
 async def scrape_quora_meta_seq(urls: List[str], page: Page) -> List[Dict]:
     """
     Asynchronously scrapes meta data for Quora URLs using a PRE-CONFIGURED page object.
     """
     results = []
-    # Block heavy resources for speed
     await page.route("**/*", lambda route: route.abort() if route.request.resource_type in {"image", "font", "stylesheet"} else route.continue_())
     for url in _dedupe(urls):
         item = {}
@@ -72,7 +91,9 @@ async def scrape_quora_meta_seq(urls: List[str], page: Page) -> List[Dict]:
             item = await _extract_page_meta_data(page, url)
         except Exception as e:
             item = {
-                "platform": "quora", "quora_link": url, "source": "meta_advanced",
+                "platform": "quora",
+                "quora_link": url,
+                "source": "quora",
                 "error": f"{e.__class__.__name__}: {str(e)}",
                 "scraped_at": int(time.time())
             }

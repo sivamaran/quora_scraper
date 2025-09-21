@@ -1,125 +1,116 @@
-# scraper_types/quora_scraper_visible_text.py (FINAL REFACTORED VERSION)
+# scraper_types/quora_scraper_visual_text.py (FINAL WITH PROFILE STATS)
 import re
-import json
 import time
-import asyncio
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
-from playwright.async_api import Page, TimeoutError
+from typing import Dict, List, Optional
+from playwright.async_api import Page
 
-# --- All of your original helper functions are kept ---
-def _norm(s: Optional[str]) -> str:
-    return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
 
-def _dedupe_keep_order(items: List[str]) -> List[str]:
+# ----------------- Helpers -----------------
+def _dedupe(seq: List[str]) -> List[str]:
     seen, out = set(), []
-    for x in items:
-        if x and x not in seen:
-            seen.add(x)
-            out.append(x)
+    for s in seq:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
     return out
 
-def _split_quora_links(links: List[str]) -> Tuple[List[str], List[str]]:
-    externals, quoras = [], []
-    for href in links:
-        try:
-            if not href.startswith("http"):
-                full_href = f"https://www.quora.com{href}"
-                quoras.append(full_href)
-                continue
-            u = urlparse(href)
-            host = (u.netloc or "").lower()
-            if "quora.com" in host:
-                quoras.append(href)
-            else:
-                cleaned = f"{u.scheme}://{u.netloc}{u.path}" if u.scheme else href
-                externals.append(cleaned.rstrip("/"))
-        except Exception:
-             if "quora.com" in href: quoras.append(href)
-             else: externals.append(href)
-    return _dedupe_keep_order(externals), _dedupe_keep_order(quoras)
 
-EMAIL_RE = re.compile(r"[a-z0-9\.\-+_]+@[a-z0-9\.\-+_]+\.[a-z]+", re.I)
-PHONE_RE = re.compile(r"(\+?\d{1,3})?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
+def _contacts(text: str) -> Dict[str, List[str]]:
+    emails = list({m.group(0) for m in re.finditer(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)})
+    phones = list({m.group(0) for m in re.finditer(r"\+?\d[\d\s().\-]{8,}\d", text)})
+    return {"emails": emails, "phones": phones}
 
-def _extract_entities_from_text(text: str) -> Dict[str, List[str]]:
-    return {
-        "emails": _dedupe_keep_order(EMAIL_RE.findall(text)),
-        "phones": _dedupe_keep_order(PHONE_RE.findall(text)),
-    }
 
-async def _click_expanders(page: Page) -> None:
-    for _ in range(10):
-        any_clicked = False
-        expand_buttons = page.locator('button:has-text("more")')
-        count = await expand_buttons.count()
-        if count == 0: break
-        for i in range(count):
-            try:
-                button = expand_buttons.nth(i)
-                if await button.is_visible():
-                    await button.click()
-                    any_clicked = True
-                    await page.wait_for_timeout(500)
-            except Exception:
-                pass
-        if not any_clicked:
-            break
+def _external_links_from_hrefs(hrefs: List[str]) -> List[str]:
+    """
+    Extract only true external links (exclude Quora internal links).
+    """
+    out = [
+        h for h in hrefs
+        if h
+        and h.startswith("http")
+        and "quora.com" not in h.lower()
+        and "quorablog.quora.com" not in h.lower()
+    ]
+    return _dedupe(out)[:20]
 
-# --- Your original data extraction function is kept ---
-async def extract_visible_text_from_quora_page(page: Page) -> Dict:
-    for _ in range(5):
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1000)
-    await _click_expanders(page)
-    question_title = ""
-    try:
-        title_locator = page.locator('div[data-testid="QuestionPage-Question-title"] span.qu-bold').first
-        question_title = _norm(await title_locator.inner_text())
-    except Exception:
-        question_title = "Title not found"
-    answers_text, answer_authors = [], []
-    answer_blocks = page.locator('div[data-testid^="Answer-TopLevel"]')
-    for i in range(await answer_blocks.count()):
-        block = answer_blocks.nth(i)
-        try:
-            text_content = _norm(await block.locator('div[data-testid="Answer-body-text"]').inner_text())
-            if text_content: answers_text.append(text_content)
-            author_name = _norm(await block.locator('a[href*="/profile/"]').first.inner_text())
-            if author_name: answer_authors.append(author_name)
-        except Exception:
-            continue
-    full_text = question_title + "\n\n" + "\n\n".join(answers_text)
-    raw_links = [await a.get_attribute("href") for a in await page.locator('a[href]').all()]
-    external_links, quora_links = _split_quora_links(_dedupe_keep_order(raw_links))
-    entities = _extract_entities_from_text(full_text)
-    return {
-        "question_title": question_title or None, "text": full_text,
-        "external_links": external_links, "quora_links": quora_links,
-        "answer_authors": _dedupe_keep_order(answer_authors),
-        "emails": entities["emails"], "phones": entities["phones"],
-    }
 
-# --- This is the new, refactored main function ---
+def _extract_number(text: Optional[str]) -> Optional[int]:
+    """Helper to turn '545,374 followers' -> 545374"""
+    if not text:
+        return None
+    nums = re.findall(r"[\d,]+", text)
+    if not nums:
+        return None
+    return int(nums[0].replace(",", ""))
+
+
+# ----------------- Main Extraction -----------------
 async def scrape_quora_visible_text_seq(urls: List[str], page: Page) -> List[Dict]:
     """
-    Sequentially scrapes Quora URLs using a PRE-CONFIGURED page object.
+    Extracts visible text (bio, description, stats) from Quora profiles/questions.
     """
     results = []
-    for url in urls:
-        item = {"platform": "quora", "quora_link": url, "scraped_at": int(time.time())}
+    for url in _dedupe(urls):
+        item = {"platform": "quora", "quora_link": url, "source": "quora"}
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_selector('div[id*="mainContent"]', timeout=20000)
-            try:
-                close_button = page.locator('button[aria-label="Close"], [aria-label="Close dialog"]').first
-                if await close_button.is_visible(timeout=5000):
-                    await close_button.click()
-            except (TimeoutError, Exception):
-                pass
-            extracted = await extract_visible_text_from_quora_page(page)
-            item.update(extracted)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            # Title / Name
+            title_el = await page.query_selector("h1, h2, .q-text")
+            title = await title_el.inner_text() if title_el else None
+
+            # Bio / Description
+            desc_el = await page.query_selector(".q-text.qu-dynamicFontSize--small, .q-relative")
+            description = await desc_el.inner_text() if desc_el else None
+
+            # Followers
+            followers_el = await page.query_selector("a[href*='followers'] .q-text, .q-box:has-text('Followers')")
+            followers_text = await followers_el.inner_text() if followers_el else None
+            followers = _extract_number(followers_text)
+
+            # Following
+            following_el = await page.query_selector("a[href*='following'] .q-text, .q-box:has-text('Following')")
+            following_text = await following_el.inner_text() if following_el else None
+            following = _extract_number(following_text)
+
+            # Answers count
+            answers_el = await page.query_selector("a[href*='answers'] .q-text, .q-box:has-text('Answers')")
+            answers_text = await answers_el.inner_text() if answers_el else None
+            answers_count = _extract_number(answers_text)
+
+            # Questions count
+            questions_el = await page.query_selector("a[href*='questions'] .q-text, .q-box:has-text('Questions')")
+            questions_text = await questions_el.inner_text() if questions_el else None
+            questions_count = _extract_number(questions_text)
+
+            # Links
+            href_nodes = await page.query_selector_all("a[href]")
+            hrefs = [await a.get_attribute("href") for a in href_nodes]
+            external_links = _external_links_from_hrefs(hrefs)
+
+            # Contact info (regex from bio + title)
+            text_blob = " ".join(filter(None, [title, description]))
+            contact_info = _contacts(text_blob)
+
+            item.update({
+                "type": "profile" if "/profile/" in url.lower() else "question",
+                "title": title,
+                "description": description,
+                "followers": followers,
+                "following": following,
+                "answers_count": answers_count,
+                "questions_count": questions_count,
+                "external_links": external_links,
+                "emails": contact_info["emails"],
+                "phones": contact_info["phones"],
+                "scraped_at": int(time.time())
+            })
         except Exception as e:
-            item["error"] = str(e)
+            item.update({
+                "error": f"{e.__class__.__name__}: {str(e)}",
+                "scraped_at": int(time.time())
+            })
+
         results.append(item)
     return results
